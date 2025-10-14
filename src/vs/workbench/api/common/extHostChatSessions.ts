@@ -15,7 +15,7 @@ import { IChatAgentRequest, IChatAgentResult } from '../../contrib/chat/common/c
 import { ChatSessionStatus, IChatSessionItem } from '../../contrib/chat/common/chatSessionsService.js';
 import { ChatAgentLocation } from '../../contrib/chat/common/constants.js';
 import { Proxied } from '../../services/extensions/common/proxyIdentifier.js';
-import { ChatSessionDto, ExtHostChatSessionsShape, IChatAgentProgressShape, MainContext, MainThreadChatSessionsShape } from './extHost.protocol.js';
+import { ChatSessionDto, ExtHostChatSessionsShape, IChatAgentProgressShape, IChatSessionModelInfoDto, MainContext, MainThreadChatSessionsShape, ChatSessionOptionsDto } from './extHost.protocol.js';
 import { ChatAgentResponseStream } from './extHostChatAgents2.js';
 import { CommandsConverter, ExtHostCommands } from './extHostCommands.js';
 import { ExtHostLanguageModels } from './extHostLanguageModels.js';
@@ -123,6 +123,7 @@ export class ExtHostChatSessions extends Disposable implements ExtHostChatSessio
 		const disposables = new DisposableStore();
 
 		this._chatSessionContentProviders.set(handle, { provider, extension, capabilities, disposable: disposables });
+		// TODO: Do I do $provideChatSessionOptions first?
 		this._proxy.$registerChatSessionContentProvider(handle, chatSessionType);
 
 		return new extHostTypes.Disposable(() => {
@@ -271,11 +272,13 @@ export class ExtHostChatSessions extends Disposable implements ExtHostChatSessio
 			});
 		}
 		const { capabilities } = provider;
+
 		return {
 			id: sessionId + '',
 			hasActiveResponseCallback: !!session.activeResponseCallback,
 			hasRequestHandler: !!session.requestHandler,
 			supportsInterruption: !!capabilities?.supportsInterruptions,
+			options: undefined,
 			history: session.history.map(turn => {
 				if (turn instanceof extHostTypes.ChatRequestTurn) {
 					return { type: 'request' as const, prompt: turn.prompt, participant: turn.participant };
@@ -291,6 +294,64 @@ export class ExtHostChatSessions extends Disposable implements ExtHostChatSessio
 				}
 			})
 		};
+	}
+
+	async $provideHandleOptionsChange(handle: number, sessionId: string, updates: ReadonlyArray<{ optionId: string; value: string | undefined }>, token: CancellationToken): Promise<void> {
+		const provider = this._chatSessionContentProviders.get(handle);
+		if (!provider) {
+			this._logService.warn(`No provider for handle ${handle}`);
+			return;
+		}
+
+		if (!provider.provider.provideHandleOptionsChange) {
+			this._logService.debug(`Provider for handle ${handle} does not implement provideHandleOptionsChange`);
+			return;
+		}
+
+		try {
+			await provider.provider.provideHandleOptionsChange(sessionId, updates, token);
+		} catch (error) {
+			this._logService.error(`Error calling provideHandleOptionsChange for handle ${handle}, sessionId ${sessionId}:`, error);
+		}
+	}
+
+	async $provideChatSessionOptions(handle: number, token: CancellationToken): Promise<ChatSessionOptionsDto | undefined> {
+		const entry = this._chatSessionContentProviders.get(handle);
+		if (!entry) {
+			this._logService.warn(`No provider for handle ${handle} when requesting chat session options`);
+			return undefined;
+		}
+
+		const provider = entry.provider;
+		if (!provider.provideChatSessionOptions) {
+			return undefined; // Provider does not implement optional method
+		}
+
+		try {
+			// Support both synchronous and thenable returns per API contract (Thenable<ChatSessionOptions> | ChatSessionOptions)
+			const options = await provider.provideChatSessionOptions(token);
+			if (!options) {
+				return undefined;
+			}
+			if (!options.models || options.models.length === 0) {
+				return {};
+			}
+			const toDto = (model: any): IChatSessionModelInfoDto => ({
+				id: model.id,
+				name: model.name,
+				family: model.family,
+				tooltip: model.tooltip,
+				detail: model.detail,
+				version: model.version,
+				maxInputTokens: model.maxInputTokens,
+				maxOutputTokens: model.maxOutputTokens,
+				capabilities: model.capabilities ?? {}
+			});
+			return { models: options.models.map(m => toDto(m)) };
+		} catch (error) {
+			this._logService.error(`Error calling provideChatSessionOptions for handle ${handle}:`, error);
+			return undefined;
+		}
 	}
 
 	async $interruptChatSessionActiveResponse(providerHandle: number, sessionId: string, requestId: string): Promise<void> {

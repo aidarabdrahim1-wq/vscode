@@ -412,8 +412,14 @@ class OpenModelPickerAction extends Action2 {
 				group: 'navigation',
 				when:
 					ContextKeyExpr.and(
-						ChatContextKeys.lockedToCodingAgent.negate(),
-						ChatContextKeys.languageModelsAreUserSelectable,
+						ContextKeyExpr.or(
+							ChatContextKeys.lockedToCodingAgent.negate(),
+							ChatContextKeys.inContributedSessionWithModels
+						),
+						ContextKeyExpr.or(
+							ChatContextKeys.languageModelsAreUserSelectable,
+							ChatContextKeys.inContributedSessionWithModels
+						),
 						ContextKeyExpr.or(
 							ContextKeyExpr.equals(ChatContextKeys.location.key, ChatAgentLocation.Chat),
 							ContextKeyExpr.equals(ChatContextKeys.location.key, ChatAgentLocation.EditorInline),

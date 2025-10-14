@@ -78,7 +78,8 @@ import { IChatEditingSession, ModifiedFileEntryState } from '../common/chatEditi
 import { ChatEntitlement, IChatEntitlementService } from '../../../services/chat/common/chatEntitlementService.js';
 import { IChatRequestModeInfo } from '../common/chatModel.js';
 import { ChatMode, IChatMode, IChatModeService } from '../common/chatModes.js';
-import { IChatFollowup } from '../common/chatService.js';
+import { IChatFollowup, IChatService } from '../common/chatService.js';
+import { IChatSessionsService } from '../common/chatSessionsService.js';
 import { ChatRequestVariableSet, IChatRequestVariableEntry, isElementVariableEntry, isImageVariableEntry, isNotebookOutputVariableEntry, isPasteVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry, isSCMHistoryItemChangeRangeVariableEntry, isSCMHistoryItemChangeVariableEntry, isSCMHistoryItemVariableEntry } from '../common/chatVariableEntries.js';
 import { IChatResponseViewModel } from '../common/chatViewModel.js';
 import { ChatInputHistoryMaxEntries, IChatHistoryEntry, IChatInputState, IChatWidgetHistoryService } from '../common/chatWidgetHistoryService.js';
@@ -107,6 +108,7 @@ import { IModelPickerDelegate, ModelPickerActionItem } from './modelPicker/model
 import { IModePickerDelegate, ModePickerActionItem } from './modelPicker/modePickerActionItem.js';
 import { assertType } from '../../../../base/common/types.js';
 import { renderLabelWithIcons } from '../../../../base/browser/ui/iconLabel/iconLabels.js';
+import { ExtensionIdentifier } from '../../../../platform/extensions/common/extensions.js';
 
 const $ = dom.$;
 
@@ -291,6 +293,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	private chatModeKindKey: IContextKey<ChatModeKind>;
 	private withinEditSessionKey: IContextKey<boolean>;
 	private filePartOfEditSessionKey: IContextKey<boolean>;
+	private inContributedSessionWithModelsKey: IContextKey<boolean>;
 
 	private modelWidget: ModelPickerActionItem | undefined;
 	private modeWidget: ModePickerActionItem | undefined;
@@ -381,6 +384,11 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	 */
 	private _generating?: { rc: number; defer: DeferredPromise<void> };
 
+	/**
+	 * Reference to the chat widget this input part belongs to
+	 */
+	private _widget?: IChatWidget;
+
 	constructor(
 		// private readonly editorOptions: ChatEditorOptions, // TODO this should be used
 		private readonly location: ChatAgentLocation,
@@ -410,6 +418,8 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		@IChatModeService private readonly chatModeService: IChatModeService,
 		@IPromptsService private readonly promptsService: IPromptsService,
 		@ILanguageModelToolsService private readonly toolService: ILanguageModelToolsService,
+		@IChatService private readonly chatService: IChatService,
+		@IChatSessionsService private readonly chatSessionsService: IChatSessionsService,
 	) {
 		super();
 		this._onDidLoadInputState = this._register(new Emitter<any>());
@@ -471,6 +481,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		this.chatModeKindKey = ChatContextKeys.chatModeKind.bindTo(contextKeyService);
 		this.withinEditSessionKey = ChatContextKeys.withinEditSessionDiff.bindTo(contextKeyService);
 		this.filePartOfEditSessionKey = ChatContextKeys.filePartOfEditSession.bindTo(contextKeyService);
+		this.inContributedSessionWithModelsKey = ChatContextKeys.inContributedSessionWithModels.bindTo(contextKeyService);
 
 		const chatToolCount = ChatContextKeys.chatToolCount.bindTo(contextKeyService);
 
@@ -697,11 +708,80 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	}
 
 	private getModels(): ILanguageModelChatMetadataAndIdentifier[] {
+		// Check if we're in a contributed session
+		const sessionInfo = this.getContributedSessionInfo();
+		if (sessionInfo) {
+			const contributedModels = this.chatSessionsService.getModelsForSessionType(sessionInfo.chatSessionType);
+			if (contributedModels !== undefined) {
+				const models: ILanguageModelChatMetadataAndIdentifier[] = [];
+				for (const m of contributedModels) {
+					// Try to look up richer metadata via existing language model service first
+					const existing = this.languageModelsService.lookupLanguageModel(m.id);
+					if (existing) {
+						models.push({ identifier: m.id, metadata: existing });
+						continue;
+					}
+					// Fallback synthetic metadata
+					models.push({
+						identifier: m.id,
+						metadata: {
+							id: m.id,
+							name: m.name,
+							family: m.family,
+							vendor: 'contributed',
+							version: m.version,
+							maxInputTokens: m.maxInputTokens,
+							maxOutputTokens: m.maxOutputTokens,
+							modelPickerCategory: undefined,
+							extension: new ExtensionIdentifier('contributed.session'),
+							isDefault: false,
+							isUserSelectable: true
+						}
+					});
+				}
+				models.sort((a, b) => a.metadata.name.localeCompare(b.metadata.name));
+				return models;
+			}
+		}
+
+		// Fallback to default behavior for non-contributed sessions or when no models are registered
 		const models = this.languageModelsService.getLanguageModelIds()
 			.map(modelId => ({ identifier: modelId, metadata: this.languageModelsService.lookupLanguageModel(modelId)! }))
 			.filter(entry => entry.metadata?.isUserSelectable && this.modelSupportedForDefaultAgent(entry));
 		models.sort((a, b) => a.metadata.name.localeCompare(b.metadata.name));
 		return models;
+	}
+
+	/**
+	 * Get contributed session information if the current session is a contributed session
+	 */
+	private getContributedSessionInfo(): { chatSessionType: string; chatSessionId: string } | undefined {
+		const model = this._widget?.viewModel?.model;
+		if (!model) {
+			return undefined;
+		}
+
+		// Check if this is a contributed session via ChatService
+		const sessionInfo = this.chatService.getChatSessionFromInternalId(model.sessionId);
+		if (sessionInfo && sessionInfo.chatSessionType !== 'local') {
+			return { chatSessionType: sessionInfo.chatSessionType, chatSessionId: sessionInfo.chatSessionId };
+		}
+
+		return undefined;
+	}
+
+	/**
+	 * Update the context key that tracks whether we're in a contributed session with models
+	 */
+	private updateContributedSessionContext(): void {
+		const sessionInfo = this.getContributedSessionInfo();
+		if (sessionInfo) {
+			const contributedModels = this.chatSessionsService.getModelsForSessionType(sessionInfo.chatSessionType);
+			// Set to true if we have models registered (even if empty array means explicitly no models)
+			this.inContributedSessionWithModelsKey.set(contributedModels !== undefined && contributedModels.length > 0);
+		} else {
+			this.inContributedSessionWithModelsKey.set(false);
+		}
 	}
 
 	private setCurrentLanguageModelToDefault() {
@@ -774,6 +854,9 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		this._attachmentModel.clearAndSetContext(...attachments);
 
 		this.selectedToolsModel.resetSessionEnablementState();
+
+		// Update contributed session context when model changes
+		this.updateContributedSessionContext();
 
 		if (state.inputValue) {
 			this.setValue(state.inputValue, false);
@@ -1077,6 +1160,11 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	}
 
 	render(container: HTMLElement, initialValue: string, widget: IChatWidget) {
+		this._widget = widget;
+
+		// Update contributed session context when widget is set
+		this.updateContributedSessionContext();
+
 		let elements;
 		if (this.options.renderStyle === 'compact') {
 			elements = dom.h('.interactive-input-part', [
@@ -1255,6 +1343,19 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 							this._waitForPersistedLanguageModel.clear();
 							this.setCurrentLanguageModel(model);
 							this.renderAttachedContext();
+
+							// Check if we're in a contributed session and notify the extension
+							const sessionInfo = this.getContributedSessionInfo();
+							if (sessionInfo) {
+								const updates = [{ optionId: 'model', value: model.identifier }];
+								this.chatSessionsService.notifySessionOptionsChange(
+									sessionInfo.chatSessionType,
+									sessionInfo.chatSessionId,
+									updates
+								).catch(err => {
+									this.logService.error('Failed to notify extension of model change:', err);
+								});
+							}
 						},
 						getModels: () => this.getModels()
 					};
